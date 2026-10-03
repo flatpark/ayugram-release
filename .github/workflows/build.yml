@@ -1,0 +1,224 @@
+name: build
+
+on:
+  # Poll upstream for a new tag. A run with nothing to build exits in seconds.
+  schedule:
+    - cron: '23 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Upstream AyuGramDesktop tag (empty = latest release)'
+        type: string
+        required: false
+      revision:
+        description: 'Rebuild revision (empty = first build; 2, 3, … publish v<ver>-<rev> next to it)'
+        type: string
+        required: false
+
+# Two runs would race to create the same release. Let a running build finish
+# and queue the next one behind it.
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  UPSTREAM: AyuGram/AyuGramDesktop
+  # Upstream's documented Linux build credentials (docs/building-linux.md) —
+  # the same pair every distro package of AyuGram builds with.
+  API_ID: '2040'
+  API_HASH: b18441a1ff607e10a989891a5462e627
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.resolve.outputs.build }}
+      upstream_tag: ${{ steps.resolve.outputs.upstream_tag }}
+      version: ${{ steps.resolve.outputs.version }}
+      release_tag: ${{ steps.resolve.outputs.release_tag }}
+      commit: ${{ steps.resolve.outputs.commit }}
+      env_tree: ${{ steps.resolve.outputs.env_tree }}
+    steps:
+      - name: Resolve upstream tag
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IN_TAG: ${{ inputs.tag }}
+          IN_REV: ${{ inputs.revision }}
+        run: |
+          set -euo pipefail
+          tag="${IN_TAG:-$(gh api "repos/$UPSTREAM/releases/latest" -q .tag_name)}"
+          [ -n "$tag" ] || { echo "cannot resolve the upstream tag" >&2; exit 1; }
+          version="${tag#v}"
+          release_tag="v$version${IN_REV:+-$IN_REV}"
+
+          commit=$(gh api "repos/$UPSTREAM/commits/$tag" -q .sha)
+          # The git tree hash of the Docker build environment at that commit:
+          # the image is rebuilt only when upstream changes it.
+          env_tree=$(gh api "repos/$UPSTREAM/contents/Telegram/build/docker?ref=$commit" \
+                       -q '.[] | select(.name == "centos_env") | .sha')
+          [ -n "$commit" ] && [ -n "$env_tree" ] || { echo "cannot resolve $tag" >&2; exit 1; }
+
+          if gh release view "$release_tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "$release_tag already released — nothing to do"
+            build=false
+          else
+            build=true
+          fi
+          {
+            echo "build=$build"
+            echo "upstream_tag=$tag"
+            echo "version=$version"
+            echo "release_tag=$release_tag"
+            echo "commit=$commit"
+            echo "env_tree=$env_tree"
+          } >> "$GITHUB_OUTPUT"
+          echo "upstream $tag ($commit), env tree $env_tree, release $release_tag, build=$build"
+
+  # The Rocky Linux 8 image with every library statically built (Qt, FFmpeg,
+  # WebRTC, …). Cold it takes a few hours, so it is pushed to GHCR keyed by the
+  # tree hash of upstream's centos_env/ and reused until that changes.
+  image:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    outputs:
+      ref: ${{ steps.ref.outputs.ref }}
+    steps:
+      - name: Image reference
+        id: ref
+        run: |
+          repo=$(echo "ghcr.io/$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
+          echo "ref=$repo/centos_env:${{ needs.check.outputs.env_tree }}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        run: echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Check for a cached image
+        id: cached
+        run: |
+          if docker manifest inspect "${{ steps.ref.outputs.ref }}" >/dev/null 2>&1; then
+            echo "hit=true" >> "$GITHUB_OUTPUT"
+            echo "reusing ${{ steps.ref.outputs.ref }}"
+          else
+            echo "hit=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Free disk space
+        if: steps.cached.outputs.hit != 'true'
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be
+        with:
+          tool-cache: true
+
+      - name: Check out the build environment
+        if: steps.cached.outputs.hit != 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM }}
+          ref: ${{ needs.check.outputs.commit }}
+          sparse-checkout: Telegram/build/docker/centos_env
+
+      # Same invocation as upstream's Telegram/build/prepare/linux.sh, with
+      # DEBUG= and LTO= to match the public tdesktop image (release-only
+      # libraries, no LTO) — it roughly halves the cold build.
+      - name: Build the image
+        if: steps.cached.outputs.hit != 'true'
+        run: |
+          set -euo pipefail
+          pipx install poetry
+          cd Telegram/build/docker/centos_env
+          poetry install
+          DEBUG= LTO= poetry run gen_dockerfile > "$RUNNER_TEMP/Dockerfile"
+          DOCKER_BUILDKIT=1 docker build -t "${{ steps.ref.outputs.ref }}" - < "$RUNNER_TEMP/Dockerfile"
+          docker push "${{ steps.ref.outputs.ref }}"
+
+  build:
+    needs: [check, image]
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+      IMAGE: ${{ needs.image.outputs.ref }}
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be
+        with:
+          tool-cache: true
+
+      - name: Check out AyuGram
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM }}
+          ref: ${{ needs.check.outputs.commit }}
+          submodules: recursive
+          path: tdesktop
+
+      - name: Pull the build environment
+        run: |
+          echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker pull "$IMAGE"
+
+      # The auto-updater is compiled out: the binary is delivered and updated by
+      # a package manager (FlatPark), and upstream publishes no Linux update feed.
+      - name: Build
+        run: |
+          docker run --rm -u "$(id -u)" \
+            -v "$PWD/tdesktop:/usr/src/tdesktop" \
+            "$IMAGE" \
+            /usr/src/tdesktop/Telegram/build/docker/centos_env/build.sh \
+            -D CMAKE_CONFIGURATION_TYPES=Release \
+            -D CMAKE_INSTALL_PREFIX=/usr \
+            -D TDESKTOP_API_ID="$API_ID" \
+            -D TDESKTOP_API_HASH="$API_HASH" \
+            -D DESKTOP_APP_DISABLE_AUTOUPDATE=ON \
+            -D DESKTOP_APP_DISABLE_CRASH_REPORTS=ON
+
+      - name: Install and strip
+        run: |
+          docker run --rm -u "$(id -u)" \
+            -v "$PWD/tdesktop:/usr/src/tdesktop" \
+            -e DESTDIR=/usr/src/tdesktop/out/install \
+            "$IMAGE" \
+            cmake --install /usr/src/tdesktop/out --config Release
+          strip tdesktop/out/install/usr/bin/AyuGram
+          ls -lR tdesktop/out/install
+          echo "NEEDED:"
+          readelf -d tdesktop/out/install/usr/bin/AyuGram | grep NEEDED
+
+      - name: Package
+        id: pkg
+        run: |
+          set -euo pipefail
+          name="ayugram-$VERSION-x86_64.tar.zst"
+          tar -C tdesktop/out/install --owner=0 --group=0 --numeric-owner \
+              -I 'zstd -19 -T0' -cf "$name" usr
+          sha256sum "$name" > "$name.sha256"
+          cat "$name.sha256"
+          ls -l "$name"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.check.outputs.release_tag }}
+          UPSTREAM_TAG: ${{ needs.check.outputs.upstream_tag }}
+          COMMIT: ${{ needs.check.outputs.commit }}
+          NAME: ${{ steps.pkg.outputs.name }}
+        run: |
+          set -euo pipefail
+          digest=$(docker image inspect --format '{{index .RepoDigests 0}}' "$IMAGE")
+          cat > notes.md <<EOF
+          Unofficial Linux x86_64 build of [AyuGram Desktop $UPSTREAM_TAG](https://github.com/$UPSTREAM/releases/tag/$UPSTREAM_TAG), made for [FlatPark](https://flatpark.org).
+
+          - Source: [\`$COMMIT\`](https://github.com/$UPSTREAM/tree/$COMMIT) — the corresponding source is upstream's [\`AyuGramDesktop-$VERSION-full.tar.gz\`](https://github.com/$UPSTREAM/releases/tag/$UPSTREAM_TAG) plus this repository's [build recipe](https://github.com/$GITHUB_REPOSITORY/blob/$GITHUB_SHA/.github/workflows/build.yml).
+          - Build environment: \`$digest\`, generated from upstream's \`Telegram/build/docker/centos_env\` at that commit.
+          - Workflow run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+          EOF
+          gh release create "$TAG" -R "$GITHUB_REPOSITORY" \
+            --title "AyuGram $VERSION" --notes-file notes.md \
+            "$NAME" "$NAME.sha256"
