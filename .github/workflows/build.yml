@@ -150,13 +150,21 @@ jobs:
         with:
           tool-cache: true
 
-      - name: Check out AyuGram
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ env.UPSTREAM }}
-          ref: ${{ needs.check.outputs.commit }}
-          submodules: recursive
-          path: tdesktop
+      # Upstream's own source release, not a git checkout of the tag: the
+      # tarball is what upstream and every distro build from, and it can carry
+      # submodule fixes made after tagging (v7.0.9's codegen did not scan
+      # ayu_-prefixed lang keys at the tag; the tarball has the fix).
+      - name: Fetch AyuGram source
+        env:
+          UPSTREAM_TAG: ${{ needs.check.outputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          src="AyuGramDesktop-$VERSION-full.tar.gz"
+          curl -fsSL -o "$src" "https://github.com/$UPSTREAM/releases/download/$UPSTREAM_TAG/$src"
+          sha256sum "$src" | tee source.sha256
+          mkdir tdesktop
+          tar -xzf "$src" -C tdesktop --strip-components=1
+          rm "$src"
 
       - name: Pull the build environment
         run: |
@@ -215,7 +223,7 @@ jobs:
           cat > notes.md <<EOF
           Unofficial Linux x86_64 build of [AyuGram Desktop $UPSTREAM_TAG](https://github.com/$UPSTREAM/releases/tag/$UPSTREAM_TAG), made for [FlatPark](https://flatpark.org).
 
-          - Source: [\`$COMMIT\`](https://github.com/$UPSTREAM/tree/$COMMIT) — the corresponding source is upstream's [\`AyuGramDesktop-$VERSION-full.tar.gz\`](https://github.com/$UPSTREAM/releases/tag/$UPSTREAM_TAG) plus this repository's [build recipe](https://github.com/$GITHUB_REPOSITORY/blob/$GITHUB_SHA/.github/workflows/build.yml).
+          - Source: upstream's [\`AyuGramDesktop-$VERSION-full.tar.gz\`](https://github.com/$UPSTREAM/releases/tag/$UPSTREAM_TAG) (sha256 \`$(cut -d' ' -f1 source.sha256)\`), tag commit [\`$COMMIT\`](https://github.com/$UPSTREAM/tree/$COMMIT), built with this repository's [build recipe](https://github.com/$GITHUB_REPOSITORY/blob/$GITHUB_SHA/.github/workflows/build.yml).
           - Build environment: \`$digest\`, generated from upstream's \`Telegram/build/docker/centos_env\` at that commit.
           - Workflow run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
           EOF

@@ -22,7 +22,7 @@ run unattended in [`.github/workflows/build.yml`](.github/workflows/build.yml):
    public tdesktop image) and push it to GHCR, tagged with the git tree hash of
    that directory. The next release reuses the image unless upstream has changed
    the environment, because a cold build takes hours.
-3. **build**: run upstream's `centos_env/build.sh` in that image with upstream's
+3. **build**: unpack upstream's `AyuGramDesktop-<ver>-full.tar.gz` source release (what distros build; it can carry submodule fixes made after tagging), run upstream's `centos_env/build.sh` in that image with upstream's
    documented API credentials and `DESKTOP_APP_DISABLE_AUTOUPDATE=ON` (Flatpak
    handles updates), then `cmake --install` and strip.
 
