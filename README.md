@@ -15,7 +15,7 @@ The recipe is upstream's own documented Linux build
 ([`docs/building-linux.md`](https://github.com/AyuGram/AyuGramDesktop/blob/dev/docs/building-linux.md)),
 run unattended in [`.github/workflows/build.yml`](.github/workflows/build.yml):
 
-1. **check**: every six hours, resolve upstream's latest release tag. If this
+1. **check**: once a day, resolve upstream's latest release tag. If this
    repository already has a release for it, stop.
 2. **image**: generate the Rocky Linux 8 build environment from upstream's
    `Telegram/build/docker/centos_env` at that tag (`DEBUG= LTO=`, as for the

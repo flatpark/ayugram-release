@@ -3,7 +3,7 @@ name: build
 on:
   # Poll upstream for a new tag. A run with nothing to build exits in seconds.
   schedule:
-    - cron: '23 */6 * * *'
+    - cron: '23 4 * * *'
   workflow_dispatch:
     inputs:
       tag:
