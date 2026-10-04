@@ -25,6 +25,9 @@ run unattended in [`.github/workflows/build.yml`](.github/workflows/build.yml):
 3. **build**: unpack upstream's `AyuGramDesktop-<ver>-full.tar.gz` source release (what distros build; it can carry submodule fixes made after tagging), run upstream's `centos_env/build.sh` in that image with upstream's
    documented API credentials and `DESKTOP_APP_DISABLE_AUTOUPDATE=ON` (Flatpak
    handles updates), then `cmake --install` and strip.
+4. **release**: publish the tarball as `v<ver>`, then ping FlatPark's release
+   hook so the Flatpak updates within minutes rather than at the next daily
+   sweep.
 
 Nothing is patched. The binary is the stock upstream source built with upstream's
 toolchain.

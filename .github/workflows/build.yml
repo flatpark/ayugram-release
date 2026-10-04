@@ -230,3 +230,25 @@ jobs:
           gh release create "$TAG" -R "$GITHUB_REPOSITORY" \
             --title "AyuGram $VERSION" --notes-file notes.md \
             "$NAME" "$NAME.sha256"
+
+      # Push-mode update: ping FlatPark's release hook so the new build is
+      # picked up within minutes instead of at the next daily update-check.
+      # Not via flatpark/publish-action: that sends this repository's name, and
+      # the hook only accepts the app's registered source (AyuGram/AyuGramDesktop),
+      # so the ping carries the upstream tag and omits `repository`. The tag is
+      # only checked to exist upstream; the resolver reads the version from this
+      # repository's latest release. Best-effort — the daily sweep is the fallback.
+      - name: Notify FlatPark
+        continue-on-error: true
+        env:
+          UPSTREAM_TAG: ${{ needs.check.outputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          payload=$(jq -n --arg t "$UPSTREAM_TAG" '{app_id: "com.ayugram.desktop", tag: $t}')
+          if ! resp=$(curl -sS --fail-with-body --retry 5 --max-time 30 \
+                -H 'content-type: application/json' -d "$payload" \
+                https://hooks.flatpark.org/release); then
+            echo "::warning::FlatPark rejected the ping: ${resp:-no response}"
+            exit 1
+          fi
+          echo "FlatPark accepted: $resp"
