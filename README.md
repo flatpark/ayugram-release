@@ -21,9 +21,11 @@ run unattended in [`.github/workflows/build.yml`](.github/workflows/build.yml):
    `Telegram/build/docker/centos_env` at that tag (`DEBUG= LTO=`, as for the
    public tdesktop image) and push it to GHCR, tagged with the git tree hash of
    that directory (`-aarch64` suffix for the arm image). Each architecture is
-   built natively, aarch64 on GitHub's `ubuntu-24.04-arm` runner; the only change
-   to upstream's environment is pointing tlottie's hardcoded `x86_64` Rust target
-   at the host. The next release reuses the image unless upstream has changed
+   built natively, aarch64 on GitHub's `ubuntu-24.04-arm` runner. Upstream only
+   builds the environment for x86_64, so the aarch64 one gets two changes:
+   tlottie's hardcoded `x86_64` Rust target points at the host, and rnnoise
+   moves from v0.2 to the next commit (`372f7b4`, which fixes v0.2's NEON
+   build). The next release reuses the image unless upstream has changed
    the environment, because a cold build takes hours.
 3. **build**: unpack upstream's `AyuGramDesktop-<ver>-full.tar.gz` source release (what distros build; it can carry submodule fixes made after tagging), run upstream's `centos_env/build.sh` in that image with upstream's
    documented API credentials and `DESKTOP_APP_DISABLE_AUTOUPDATE=ON` (Flatpak

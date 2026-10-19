@@ -138,9 +138,11 @@ jobs:
 
       # Same invocation as upstream's Telegram/build/prepare/linux.sh, with
       # DEBUG= and LTO= to match the public tdesktop image (release-only
-      # libraries, no LTO) — it roughly halves the cold build. The one
-      # x86-only line upstream is tlottie's hardcoded Rust target; on other
-      # architectures it is pointed at the host's.
+      # libraries, no LTO) — it roughly halves the cold build. Upstream only
+      # builds it for x86_64; for aarch64, tlottie's hardcoded Rust target is
+      # pointed at the host's, and rnnoise moves from v0.2 to the commit right
+      # after it (372f7b4, "Fix compilation errors"): v0.2's NEON path includes
+      # a header the release never shipped.
       - name: Build the image
         if: steps.cached.outputs.hit != 'true'
         run: |
@@ -150,7 +152,14 @@ jobs:
           cd Telegram/build/docker/centos_env
           poetry install
           DEBUG= LTO= poetry run gen_dockerfile > "$RUNNER_TEMP/Dockerfile"
-          sed -i 's/x86_64-unknown-linux-gnu/${{ matrix.arch }}-unknown-linux-gnu/g' "$RUNNER_TEMP/Dockerfile"
+          if [ "${{ matrix.arch }}" = aarch64 ]; then
+            sed -i \
+              -e 's/x86_64-unknown-linux-gnu/aarch64-unknown-linux-gnu/g' \
+              -e '/^git clone -b v0.2 --depth=1 https:\/\/github.com\/xiph\/rnnoise.git$/{n;s/^cd rnnoise$/&\ngit fetch --depth=1 origin 372f7b4b76cde4ca1ec4605353dd17898a99de38\ngit checkout -q FETCH_HEAD/}' \
+              "$RUNNER_TEMP/Dockerfile"
+            grep -q 'aarch64-unknown-linux-gnu' "$RUNNER_TEMP/Dockerfile"
+            grep -q '^git fetch --depth=1 origin 372f7b4b' "$RUNNER_TEMP/Dockerfile"
+          fi
           DOCKER_BUILDKIT=1 docker build -t "${{ steps.ref.outputs.ref }}" - < "$RUNNER_TEMP/Dockerfile"
           docker push "${{ steps.ref.outputs.ref }}"
 
