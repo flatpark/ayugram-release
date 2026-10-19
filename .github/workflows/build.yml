@@ -14,6 +14,10 @@ on:
         description: 'Rebuild revision (empty = first build; 2, 3, … publish v<ver>-<rev> next to it)'
         type: string
         required: false
+      publish:
+        description: 'Publish a release and notify FlatPark (off = build only, binaries as run artifacts)'
+        type: boolean
+        default: true
 
 # Two runs would race to create the same release. Let a running build finish
 # and queue the next one behind it.
@@ -49,6 +53,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           IN_TAG: ${{ inputs.tag }}
           IN_REV: ${{ inputs.revision }}
+          PUBLISH: ${{ github.event_name != 'workflow_dispatch' || inputs.publish }}
         run: |
           set -euo pipefail
           tag="${IN_TAG:-$(gh api "repos/$UPSTREAM/releases/latest" -q .tag_name)}"
@@ -63,7 +68,9 @@ jobs:
                        -q '.[] | select(.name == "centos_env") | .sha')
           [ -n "$commit" ] && [ -n "$env_tree" ] || { echo "cannot resolve $tag" >&2; exit 1; }
 
-          if gh release view "$release_tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          if [ "$PUBLISH" != true ]; then
+            build=true
+          elif gh release view "$release_tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "$release_tag already released — nothing to do"
             build=false
           else
@@ -81,20 +88,26 @@ jobs:
 
   # The Rocky Linux 8 image with every library statically built (Qt, FFmpeg,
   # WebRTC, …). Cold it takes a few hours, so it is pushed to GHCR keyed by the
-  # tree hash of upstream's centos_env/ and reused until that changes.
+  # tree hash of upstream's centos_env/ and reused until that changes. Each
+  # architecture builds natively on its own runner; the x86_64 tag keeps its
+  # original unsuffixed name so existing images stay reusable.
   image:
     needs: check
     if: needs.check.outputs.build == 'true'
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64,  runner: ubuntu-latest,    suffix: '' }
+          - { arch: aarch64, runner: ubuntu-24.04-arm, suffix: '-aarch64' }
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 350
-    outputs:
-      ref: ${{ steps.ref.outputs.ref }}
     steps:
       - name: Image reference
         id: ref
         run: |
           repo=$(echo "ghcr.io/$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
-          echo "ref=$repo/centos_env:${{ needs.check.outputs.env_tree }}" >> "$GITHUB_OUTPUT"
+          echo "ref=$repo/centos_env:${{ needs.check.outputs.env_tree }}${{ matrix.suffix }}" >> "$GITHUB_OUTPUT"
 
       - name: Log in to GHCR
         run: echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
@@ -125,26 +138,41 @@ jobs:
 
       # Same invocation as upstream's Telegram/build/prepare/linux.sh, with
       # DEBUG= and LTO= to match the public tdesktop image (release-only
-      # libraries, no LTO) — it roughly halves the cold build.
+      # libraries, no LTO) — it roughly halves the cold build. The one
+      # x86-only line upstream is tlottie's hardcoded Rust target; on other
+      # architectures it is pointed at the host's.
       - name: Build the image
         if: steps.cached.outputs.hit != 'true'
         run: |
           set -euo pipefail
+          command -v pipx >/dev/null || { sudo apt-get update && sudo apt-get install -y pipx; }
           pipx install poetry
           cd Telegram/build/docker/centos_env
           poetry install
           DEBUG= LTO= poetry run gen_dockerfile > "$RUNNER_TEMP/Dockerfile"
+          sed -i 's/x86_64-unknown-linux-gnu/${{ matrix.arch }}-unknown-linux-gnu/g' "$RUNNER_TEMP/Dockerfile"
           DOCKER_BUILDKIT=1 docker build -t "${{ steps.ref.outputs.ref }}" - < "$RUNNER_TEMP/Dockerfile"
           docker push "${{ steps.ref.outputs.ref }}"
 
   build:
     needs: [check, image]
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64,  runner: ubuntu-latest,    suffix: '' }
+          - { arch: aarch64, runner: ubuntu-24.04-arm, suffix: '-aarch64' }
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 350
     env:
       VERSION: ${{ needs.check.outputs.version }}
-      IMAGE: ${{ needs.image.outputs.ref }}
+      ARCH: ${{ matrix.arch }}
     steps:
+      - name: Image reference
+        run: |
+          repo=$(echo "ghcr.io/$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
+          echo "IMAGE=$repo/centos_env:${{ needs.check.outputs.env_tree }}${{ matrix.suffix }}" >> "$GITHUB_ENV"
+
       - name: Free disk space
         uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be
         with:
@@ -199,37 +227,68 @@ jobs:
           readelf -d tdesktop/out/install/usr/bin/AyuGram | grep NEEDED
 
       - name: Package
-        id: pkg
         run: |
           set -euo pipefail
-          name="ayugram-$VERSION-x86_64.tar.zst"
+          name="ayugram-$VERSION-$ARCH.tar.zst"
           tar -C tdesktop/out/install --owner=0 --group=0 --numeric-owner \
               -I 'zstd -19 -T0' -cf "$name" usr
           sha256sum "$name" > "$name.sha256"
           cat "$name.sha256"
           ls -l "$name"
-          echo "name=$name" >> "$GITHUB_OUTPUT"
+          docker image inspect --format '{{index .RepoDigests 0}}' "$IMAGE" > "image-$ARCH.digest"
+          mv source.sha256 "source-$ARCH.sha256"
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: ayugram-${{ matrix.arch }}
+          path: |
+            ayugram-*.tar.zst
+            ayugram-*.tar.zst.sha256
+            image-*.digest
+            source-*.sha256
+          if-no-files-found: error
+          compression-level: 0
+
+
+  # One release per version carrying every architecture, so it is created only
+  # after all builds succeeded.
+  release:
+    needs: [check, build]
+    if: github.event_name != 'workflow_dispatch' || inputs.publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download builds
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ayugram-*
+          merge-multiple: true
 
       - name: Release
         env:
           GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.check.outputs.version }}
           TAG: ${{ needs.check.outputs.release_tag }}
           UPSTREAM_TAG: ${{ needs.check.outputs.upstream_tag }}
           COMMIT: ${{ needs.check.outputs.commit }}
-          NAME: ${{ steps.pkg.outputs.name }}
         run: |
           set -euo pipefail
-          digest=$(docker image inspect --format '{{index .RepoDigests 0}}' "$IMAGE")
+          ls -l
+          # Every build unpacked the same upstream tarball.
+          [ "$(cat source-*.sha256 | cut -d' ' -f1 | sort -u | wc -l)" = 1 ]
+          src_sha=$(cut -d' ' -f1 source-x86_64.sha256)
           cat > notes.md <<EOF
-          Unofficial Linux x86_64 build of [AyuGram Desktop $UPSTREAM_TAG](https://github.com/$UPSTREAM/releases/tag/$UPSTREAM_TAG), made for [FlatPark](https://flatpark.org).
+          Unofficial Linux x86_64 and aarch64 builds of [AyuGram Desktop $UPSTREAM_TAG](https://github.com/$UPSTREAM/releases/tag/$UPSTREAM_TAG), made for [FlatPark](https://flatpark.org).
 
-          - Source: upstream's [\`AyuGramDesktop-$VERSION-full.tar.gz\`](https://github.com/$UPSTREAM/releases/tag/$UPSTREAM_TAG) (sha256 \`$(cut -d' ' -f1 source.sha256)\`), tag commit [\`$COMMIT\`](https://github.com/$UPSTREAM/tree/$COMMIT), built with this repository's [build recipe](https://github.com/$GITHUB_REPOSITORY/blob/$GITHUB_SHA/.github/workflows/build.yml).
-          - Build environment: \`$digest\`, generated from upstream's \`Telegram/build/docker/centos_env\` at that commit.
+          - Source: upstream's [\`AyuGramDesktop-$VERSION-full.tar.gz\`](https://github.com/$UPSTREAM/releases/tag/$UPSTREAM_TAG) (sha256 \`$src_sha\`), tag commit [\`$COMMIT\`](https://github.com/$UPSTREAM/tree/$COMMIT), built with this repository's [build recipe](https://github.com/$GITHUB_REPOSITORY/blob/$GITHUB_SHA/.github/workflows/build.yml).
+          - Build environment, generated from upstream's \`Telegram/build/docker/centos_env\` at that commit:
+            - x86_64: \`$(cat image-x86_64.digest)\`
+            - aarch64: \`$(cat image-aarch64.digest)\`
           - Workflow run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
           EOF
           gh release create "$TAG" -R "$GITHUB_REPOSITORY" \
             --title "AyuGram $VERSION" --notes-file notes.md \
-            "$NAME" "$NAME.sha256"
+            ayugram-*.tar.zst ayugram-*.tar.zst.sha256
 
       # Push-mode update: ping FlatPark's release hook so the new build is
       # picked up within minutes instead of at the next daily update-check.

@@ -1,6 +1,6 @@
 # ayugram-release
 
-Unofficial Linux x86_64 builds of [AyuGram Desktop](https://github.com/AyuGram/AyuGramDesktop)
+Unofficial Linux x86_64 and aarch64 builds of [AyuGram Desktop](https://github.com/AyuGram/AyuGramDesktop)
 for [FlatPark](https://flatpark.org).
 
 Upstream publishes Windows and macOS binaries but no Linux one. This repository
@@ -20,12 +20,15 @@ run unattended in [`.github/workflows/build.yml`](.github/workflows/build.yml):
 2. **image**: generate the Rocky Linux 8 build environment from upstream's
    `Telegram/build/docker/centos_env` at that tag (`DEBUG= LTO=`, as for the
    public tdesktop image) and push it to GHCR, tagged with the git tree hash of
-   that directory. The next release reuses the image unless upstream has changed
+   that directory (`-aarch64` suffix for the arm image). Each architecture is
+   built natively, aarch64 on GitHub's `ubuntu-24.04-arm` runner; the only change
+   to upstream's environment is pointing tlottie's hardcoded `x86_64` Rust target
+   at the host. The next release reuses the image unless upstream has changed
    the environment, because a cold build takes hours.
 3. **build**: unpack upstream's `AyuGramDesktop-<ver>-full.tar.gz` source release (what distros build; it can carry submodule fixes made after tagging), run upstream's `centos_env/build.sh` in that image with upstream's
    documented API credentials and `DESKTOP_APP_DISABLE_AUTOUPDATE=ON` (Flatpak
    handles updates), then `cmake --install` and strip.
-4. **release**: publish the tarball as `v<ver>`, then ping FlatPark's release
+4. **release**: once both architectures have built, publish the tarballs as `v<ver>`, then ping FlatPark's release
    hook so the Flatpak updates within minutes rather than at the next daily
    sweep.
 
@@ -36,8 +39,8 @@ toolchain.
 
 | File | Contents |
 |---|---|
-| `ayugram-<ver>-x86_64.tar.zst` | the `cmake --install` tree under `usr/`: `bin/AyuGram` (self-contained, statically linked Qt/FFmpeg/…), desktop file, icons, metainfo, D-Bus service |
-| `ayugram-<ver>-x86_64.tar.zst.sha256` | checksum |
+| `ayugram-<ver>-<arch>.tar.zst` (`x86_64`, `aarch64`) | the `cmake --install` tree under `usr/`: `bin/AyuGram` (self-contained, statically linked Qt/FFmpeg/…), desktop file, icons, metainfo, D-Bus service |
+| `ayugram-<ver>-<arch>.tar.zst.sha256` | checksum |
 
 Each release's notes record the upstream commit, the build-environment image
 digest and the workflow run.
@@ -46,7 +49,8 @@ digest and the workflow run.
 
 A release is never overwritten, because FlatPark pins each artifact's sha256. To
 rebuild a version, run the workflow manually with `revision` set (e.g. `2`). That
-publishes `v<ver>-2` next to the original release.
+publishes `v<ver>-2` next to the original release. With `publish` unchecked the
+run only builds, leaving the tarballs as workflow-run artifacts.
 
 ## Licence
 
